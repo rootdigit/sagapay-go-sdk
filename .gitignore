@@ -1,1 +1,31 @@
-/.DS_Store
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binaries and coverage
+*.test
+*.out
+coverage.txt
+
+# Vendored dependencies
+vendor/
+
+# Go workspace file
+go.work
+go.work.sum
+
+# Environment
+.env
+.env.*
+
+# Editor directories
+.idea/
+.vscode/
+*.swp
+
+# OS files
+.DS_Store
+Thumbs.db

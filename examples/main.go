@@ -6,7 +6,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/halfindex/sagapay-go-sdk"
+	"github.com/rootdigit/sagapay-go-sdk"
 )
 
 func main() {
@@ -40,7 +40,11 @@ func main() {
 	fmt.Println("✓ Deposit address created:")
 	fmt.Printf("  ID: %s\n", depositResponse.ID)
 	fmt.Printf("  Address: %s\n", depositResponse.Address)
-	fmt.Printf("  Expires At: %s\n", depositResponse.ExpiresAt.Format(time.RFC3339))
+	if depositResponse.ExpiresAt != nil {
+		fmt.Printf("  Expires At: %s\n", depositResponse.ExpiresAt.Format(time.RFC3339))
+	} else {
+		fmt.Println("  Expires At: never (PERMANENT address)")
+	}
 	fmt.Printf("  Status: %s\n\n", depositResponse.Status)
 
 	// Example 2: Create a withdrawal
@@ -65,7 +69,7 @@ func main() {
 	// Example 3: Check transaction status
 	fmt.Println("Checking transaction status...")
 	address := "0x742d35Cc6634C0532925a3b844Bc454e4438f44e"
-	statusResponse, err := client.CheckTransactionStatus(ctx, address, sagapay.TransactionTypeDeposit)
+	statusResponse, err := client.CheckTransactionStatus(ctx, sagapay.TransactionTypeDeposit, sagapay.CheckTransactionStatusOptions{Address: address})
 	if err != nil {
 		log.Fatalf("Failed to check transaction status: %v", err)
 	}

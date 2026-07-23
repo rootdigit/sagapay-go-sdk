@@ -18,7 +18,7 @@ import (
 const (
 	// DefaultBaseURL is the default base URL for the SagaPay API
 	DefaultBaseURL = "https://api2.sagapay.net"
-	
+
 	// DefaultTimeout is the default timeout for API requests
 	DefaultTimeout = 30 * time.Second
 )
@@ -96,7 +96,7 @@ func NewClient(config Config) (*Client, error) {
 // CreateDeposit creates a new deposit address for receiving cryptocurrency
 func (c *Client) CreateDeposit(ctx context.Context, params CreateDepositParams) (*DepositResponse, error) {
 	endpoint := "/create-deposit"
-	
+
 	// Validate params
 	if err := params.Validate(); err != nil {
 		return nil, err
@@ -114,7 +114,7 @@ func (c *Client) CreateDeposit(ctx context.Context, params CreateDepositParams) 
 // CreateWithdrawal creates a cryptocurrency withdrawal request
 func (c *Client) CreateWithdrawal(ctx context.Context, params CreateWithdrawalParams) (*WithdrawalResponse, error) {
 	endpoint := "/create-withdrawal"
-	
+
 	// Validate params
 	if err := params.Validate(); err != nil {
 		return nil, err
@@ -129,19 +129,29 @@ func (c *Client) CreateWithdrawal(ctx context.Context, params CreateWithdrawalPa
 	return &response, nil
 }
 
-// CheckTransactionStatus gets the status of transactions for a specific blockchain address
-func (c *Client) CheckTransactionStatus(ctx context.Context, address string, transactionType TransactionType) (*TransactionStatusResponse, error) {
+// CheckTransactionStatusOptions holds optional parameters for CheckTransactionStatus
+type CheckTransactionStatusOptions struct {
+	Address string
+	ID      string
+}
+
+// CheckTransactionStatus gets the status of transactions by address or ID
+func (c *Client) CheckTransactionStatus(ctx context.Context, transactionType TransactionType, opts CheckTransactionStatusOptions) (*TransactionStatusResponse, error) {
 	endpoint := "/check-transaction-status"
 
-	// Validate params
-	if address == "" {
-		return nil, fmt.Errorf("address is required")
+	if opts.Address == "" && opts.ID == "" {
+		return nil, fmt.Errorf("either address or id is required")
 	}
 
 	// Build query parameters
 	queryParams := url.Values{}
-	queryParams.Add("address", address)
 	queryParams.Add("type", string(transactionType))
+	if opts.Address != "" {
+		queryParams.Add("address", opts.Address)
+	}
+	if opts.ID != "" {
+		queryParams.Add("id", opts.ID)
+	}
 
 	var response TransactionStatusResponse
 	err := c.sendRequestWithQuery(ctx, http.MethodGet, endpoint, queryParams, nil, &response)
@@ -159,6 +169,9 @@ func (c *Client) FetchWalletBalance(ctx context.Context, address string, network
 	// Validate params
 	if address == "" {
 		return nil, fmt.Errorf("address is required")
+	}
+	if networkType == "" {
+		return nil, fmt.Errorf("networkType is required")
 	}
 
 	// Build query parameters
@@ -178,13 +191,53 @@ func (c *Client) FetchWalletBalance(ctx context.Context, address string, network
 	return &response, nil
 }
 
-// sendRequest sends an API request and parses the response
+// VerifyIPN verifies an IPN notification against the SagaPay API. This is the
+// primary way to confirm that a received webhook notification is genuine.
+//
+// The verify-ipn endpoint takes the API credentials in the request body rather
+// than in headers, so this request is sent without the authentication headers.
+func (c *Client) VerifyIPN(ctx context.Context, params VerifyIPNParams) (*VerifyIPNResponse, error) {
+	endpoint := "/verify-ipn"
+
+	// Validate params
+	if err := params.Validate(); err != nil {
+		return nil, err
+	}
+
+	// Inject the client credentials into the request body
+	body := struct {
+		VerifyIPNParams
+		APIKey    string `json:"apiKey"`
+		APISecret string `json:"apiSecret"`
+	}{
+		VerifyIPNParams: params,
+		APIKey:          c.apiKey,
+		APISecret:       c.apiSecret,
+	}
+
+	var response VerifyIPNResponse
+	err := c.doRequest(ctx, http.MethodPost, endpoint, nil, body, &response, false)
+	if err != nil {
+		return nil, err
+	}
+
+	return &response, nil
+}
+
+// sendRequest sends an authenticated API request and parses the response
 func (c *Client) sendRequest(ctx context.Context, method, path string, body interface{}, v interface{}) error {
 	return c.sendRequestWithQuery(ctx, method, path, nil, body, v)
 }
 
-// sendRequestWithQuery sends an API request with query parameters and parses the response
+// sendRequestWithQuery sends an authenticated API request with query parameters and parses the response
 func (c *Client) sendRequestWithQuery(ctx context.Context, method, path string, query url.Values, body interface{}, v interface{}) error {
+	return c.doRequest(ctx, method, path, query, body, v, true)
+}
+
+// doRequest sends an API request and parses the response. When withAuth is
+// false, the x-api-key/x-api-secret headers are omitted (used by endpoints
+// such as verify-ipn that take the credentials in the request body).
+func (c *Client) doRequest(ctx context.Context, method, path string, query url.Values, body interface{}, v interface{}, withAuth bool) error {
 	// Create the request URL
 	u, err := url.Parse(path)
 	if err != nil {
@@ -216,8 +269,10 @@ func (c *Client) sendRequestWithQuery(ctx context.Context, method, path string, 
 	// Set headers
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("x-api-key", c.apiKey)
-	req.Header.Set("x-api-secret", c.apiSecret)
+	if withAuth {
+		req.Header.Set("x-api-key", c.apiKey)
+		req.Header.Set("x-api-secret", c.apiSecret)
+	}
 
 	// Send the request
 	resp, err := c.client.Do(req)
@@ -232,6 +287,7 @@ func (c *Client) sendRequestWithQuery(ctx context.Context, method, path string, 
 		if err := json.NewDecoder(resp.Body).Decode(&apiErr); err != nil {
 			return fmt.Errorf("HTTP error: %d - failed to parse error response", resp.StatusCode)
 		}
+		apiErr.Code = resp.StatusCode
 		return &apiErr
 	}
 

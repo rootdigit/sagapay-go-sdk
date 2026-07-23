@@ -27,6 +27,16 @@ const (
 	TransactionTypeWithdrawal TransactionType = "withdrawal"
 )
 
+// IPNType represents the transaction type reported in IPN (webhook) notifications.
+// Unlike TransactionType, IPN notifications use uppercase values.
+type IPNType string
+
+// IPN types
+const (
+	IPNTypeDeposit    IPNType = "DEPOSIT"
+	IPNTypeWithdrawal IPNType = "WITHDRAWAL"
+)
+
 // TransactionStatus represents the status of a transaction
 type TransactionStatus string
 
@@ -50,12 +60,13 @@ const (
 
 // CreateDepositParams represents the parameters for creating a deposit
 type CreateDepositParams struct {
-	NetworkType    NetworkType `json:"networkType"`
+	NetworkType     NetworkType `json:"networkType"`
 	ContractAddress string      `json:"contractAddress"`
-	Amount         string      `json:"amount"`
-	IPNUrl         string      `json:"ipnUrl"`
-	UDF            string      `json:"udf,omitempty"`
-	Type           AddressType `json:"type,omitempty"`
+	Amount          string      `json:"amount"`
+	IPNUrl          string      `json:"ipnUrl"`
+	UDF             string      `json:"udf,omitempty"`
+	Type            AddressType `json:"type,omitempty"`
+	TransferBalance *bool       `json:"transferBalance,omitempty"` // Optional: defaults to true when omitted
 }
 
 // Validate validates the create deposit parameters
@@ -109,7 +120,7 @@ func (p *CreateWithdrawalParams) Validate() error {
 type DepositResponse struct {
 	ID        string            `json:"id"`
 	Address   string            `json:"address"`
-	ExpiresAt time.Time         `json:"expiresAt"`
+	ExpiresAt *time.Time        `json:"expiresAt"`
 	Amount    string            `json:"amount"`
 	Status    TransactionStatus `json:"status"`
 }
@@ -142,15 +153,19 @@ type Transaction struct {
 	NetworkType     NetworkType       `json:"networkType"`
 	ContractAddress string            `json:"contractAddress"`
 	Address         string            `json:"address"`
+	UDF             string            `json:"udf,omitempty"`
 	Token           Token             `json:"token"`
+	Confirmations   *int              `json:"confirmations,omitempty"` // Deposit transactions only
+	Fee             *string           `json:"fee,omitempty"`           // Withdrawal transactions only
+	ProcessedAt     *time.Time        `json:"processedAt,omitempty"`   // Withdrawal transactions only, nullable
 }
 
 // TransactionStatusResponse represents the response from checking transaction status
 type TransactionStatusResponse struct {
-	Address         string        `json:"address"`
+	Address         string          `json:"address"`
 	TransactionType TransactionType `json:"transactionType"`
-	Count           int           `json:"count"`
-	Transactions    []Transaction `json:"transactions"`
+	Count           int             `json:"count"`
+	Transactions    []Transaction   `json:"transactions"`
 }
 
 // Balance represents a wallet balance
@@ -168,28 +183,62 @@ type WalletBalanceResponse struct {
 	Balance         Balance     `json:"balance"`
 }
 
-// WebhookPayload represents the payload sent in webhook notifications
+// WebhookPayload represents the payload sent in webhook (IPN) notifications
 type WebhookPayload struct {
-	ID              string            `json:"id"`
-	Type            TransactionType   `json:"type"`
-	Status          TransactionStatus `json:"status"`
-	Address         string            `json:"address"`
-	NetworkType     NetworkType       `json:"networkType"`
-	Amount          string            `json:"amount"`
-	UDF             string            `json:"udf,omitempty"`
-	TxHash          string            `json:"txHash,omitempty"`
-	Timestamp       time.Time         `json:"timestamp"`
+	ID          string            `json:"id"`
+	Type        IPNType           `json:"type"`
+	Status      TransactionStatus `json:"status"` // Currently always COMPLETED
+	Address     string            `json:"address"`
+	NetworkType NetworkType       `json:"networkType"`
+	Amount      string            `json:"amount"`
+	UDF         string            `json:"udf,omitempty"`
+	TxHash      string            `json:"txHash,omitempty"`
+	Timestamp   time.Time         `json:"timestamp"`
+}
+
+// VerifyIPNParams represents the parameters for verifying an IPN notification
+type VerifyIPNParams struct {
+	TxnHash string  `json:"txnHash"`
+	Type    IPNType `json:"type"`
+	Amount  string  `json:"amount"`
+	Address string  `json:"address"`
+}
+
+// Validate validates the verify IPN parameters
+func (p *VerifyIPNParams) Validate() error {
+	if p.TxnHash == "" {
+		return errors.New("txnHash is required")
+	}
+	if p.Type == "" {
+		return errors.New("type is required")
+	}
+	if p.Amount == "" {
+		return errors.New("amount is required")
+	}
+	if p.Address == "" {
+		return errors.New("address is required")
+	}
+	return nil
+}
+
+// VerifyIPNResponse represents the response from verifying an IPN notification
+type VerifyIPNResponse struct {
+	Verified bool `json:"verified"`
 }
 
 // APIError represents an error response from the API
 type APIError struct {
-	Error   string      `json:"error"`
-	Message string      `json:"message"`
-	Data    interface{} `json:"data,omitempty"`
-	Code    int         `json:"-"`
+	// ErrMessage is the message from the API's "error" field
+	ErrMessage string `json:"error"`
+
+	// Code is the HTTP status code of the error response
+	Code int `json:"-"`
 }
 
 // Error implements the error interface
 func (e *APIError) Error() string {
-	return fmt.Sprintf("API error: %s - %s", e.Error, e.Message)
+	if e.Code != 0 {
+		return fmt.Sprintf("sagapay: API error (HTTP %d): %s", e.Code, e.ErrMessage)
+	}
+	return fmt.Sprintf("sagapay: API error: %s", e.ErrMessage)
 }
