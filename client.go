@@ -17,7 +17,7 @@ import (
 
 const (
 	// DefaultBaseURL is the default base URL for the SagaPay API
-	DefaultBaseURL = "https://api2.sagapay.net"
+	DefaultBaseURL = "https://api2.sagapay.io"
 
 	// DefaultTimeout is the default timeout for API requests
 	DefaultTimeout = 30 * time.Second
