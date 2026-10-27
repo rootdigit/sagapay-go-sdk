@@ -1,98 +1,84 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"sync"
 	"time"
 
 	"github.com/rootdigit/sagapay-go-sdk"
 )
 
 func main() {
-	// Initialize the SagaPay client, used to confirm notifications via verify-ipn
-	client, err := sagapay.NewClient(sagapay.Config{
-		APIKey:    "your-api-key",
-		APISecret: "your-api-secret",
-	})
-	if err != nil {
-		log.Fatalf("Failed to create client: %v", err)
+	// Your signing secret: dashboard → Webhooks → Signing secret. It is NOT
+	// your API secret. Notifications whose X-Sagapay-Merchant-Signature does
+	// not match it are rejected.
+	signingSecret := os.Getenv("SAGAPAY_SIGNING_SECRET")
+	if signingSecret == "" {
+		log.Fatal("Set SAGAPAY_SIGNING_SECRET to your signing secret from the dashboard's Webhooks page")
 	}
 
-	// The platform-issued IPN signing secret (optional feature). This is NOT
-	// your API secret. Leave it empty if you have not been issued one; the
-	// handler then skips signature verification and the VerifyIPN call below
-	// is the primary check.
-	ipnSecret := ""
+	// Optional: also refuse notifications older than a day.
+	webhookHandler := sagapay.NewWebhookHandler(signingSecret).WithMaxAge(sagapay.DefaultMaxAge)
 
-	// Create a webhook handler
-	webhookHandler := sagapay.NewWebhookHandler(ipnSecret)
+	// IDs already handled. Use a database table with a unique column in
+	// production; this map is lost on restart.
+	var mu sync.Mutex
+	processed := map[string]bool{}
 
-	// Set up a handler for webhook notifications
 	http.HandleFunc("/webhook", func(w http.ResponseWriter, r *http.Request) {
-		// Only accept POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
-		// Process the webhook
+		// Verifies the signature over the exact raw body, then parses it.
 		payload, err := webhookHandler.HandleRequest(r)
 		if err != nil {
-			log.Printf("Error processing webhook: %v", err)
-			sagapay.SendErrorResponse(w, err)
+			log.Printf("Rejected webhook: %v", err)
+			http.Error(w, "Invalid webhook", http.StatusUnauthorized)
 			return
 		}
 
-		// Log the webhook
-		log.Printf("Received webhook: ID=%s, Type=%s, Status=%s", payload.ID, payload.Type, payload.Status)
+		log.Printf("Received webhook: ID=%s, Type=%s, Asset=%s, Amount=%s", payload.ID, payload.Type, payload.Asset, payload.Amount)
 
-		// Confirm the notification with SagaPay before trusting it. This is
-		// the primary verification step. Note that SagaPay delivers IPNs
-		// at least once, so the same notification may arrive more than once;
-		// make your business logic idempotent.
-		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
-		defer cancel()
-		verification, err := client.VerifyIPN(ctx, sagapay.VerifyIPNParams{
-			TxnHash: payload.TxHash,
-			Type:    payload.Type,
-			Amount:  payload.Amount,
-			Address: payload.Address,
-		})
-		if err != nil {
-			log.Printf("Error verifying IPN: %v", err)
-			sagapay.SendErrorResponse(w, err)
-			return
-		}
-		if !verification.Verified {
-			log.Printf("IPN could not be verified, ignoring: ID=%s", payload.ID)
-			sagapay.SendErrorResponse(w, fmt.Errorf("IPN not verified"))
+		// Delivery is at-least-once, and a replayed request carries a valid
+		// signature too, so act on each ID only once.
+		mu.Lock()
+		seen := processed[payload.ID]
+		processed[payload.ID] = true
+		mu.Unlock()
+		if seen {
+			sagapay.SendSuccessResponse(w)
 			return
 		}
 
-		// Handle the notification by type. The status field is currently
-		// always COMPLETED - SagaPay only sends IPNs for completed transactions.
+		// The status field is currently always COMPLETED - SagaPay only sends
+		// IPNs for completed transactions.
 		switch payload.Type {
 		case sagapay.IPNTypeDeposit:
-			log.Printf("Deposit %s completed: %s", payload.ID, payload.Amount)
-
-			// Your business logic here...
-			// For example, update order status in your database
+			// Check payload.Asset, payload.ContractAddress and payload.Amount
+			// against the order before you mark it paid.
+			log.Printf("Deposit %s completed: %s %s", payload.ID, payload.Amount, payload.Asset)
 			// updateOrderStatus(payload.UDF, "paid")
 
 		case sagapay.IPNTypeWithdrawal:
-			log.Printf("Withdrawal %s completed: %s", payload.ID, payload.Amount)
-
-			// Your business logic here...
+			log.Printf("Withdrawal %s completed: %s", payload.ID, payload.TxHash)
 			// updateWithdrawalStatus(payload.UDF, "completed")
 		}
 
-		// Send a success response
+		// Answer within 20 seconds. If your own processing fails, answer 5xx
+		// instead so SagaPay retries.
 		sagapay.SendSuccessResponse(w)
 	})
 
-	// Start the server
+	server := &http.Server{
+		Addr:              ":8080",
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       20 * time.Second,
+	}
 	fmt.Println("Starting webhook server on :8080...")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	log.Fatal(server.ListenAndServe())
 }

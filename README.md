@@ -88,8 +88,13 @@ withdrawalResponse, err := client.CreateWithdrawal(ctx, sagapay.CreateWithdrawal
     Amount:          "10.5",
     IPNUrl:          "https://example.com/webhook",
     UDF:             "withdrawal-456",
+    IdempotencyKey:  "payout-456", // Optional, recommended
 })
 ```
+
+Withdrawals need an API key created with **Withdrawals** turned on, which requires two-factor authentication on your account.
+
+`IdempotencyKey` (1-128 letters, digits, `-` or `_`) is sent as the `Idempotency-Key` header, so that a retry after a timeout or network error cannot send the money twice. For 24 hours, a repeat with the same key returns the first withdrawal instead of creating another; while the first request is still running, a repeat fails with a 409 `APIError`. Use one key per payout, such as your own payout id.
 
 ### Check Transaction Status
 
@@ -126,7 +131,7 @@ balanceResponse, err := client.FetchWalletBalance(
 
 ### Verify IPN
 
-`VerifyIPN` confirms a received webhook (IPN) notification against the SagaPay API and is the primary way to check that a notification is genuine. The API credentials are sent in the request body for this endpoint, not in headers.
+`VerifyIPN` confirms a received webhook (IPN) notification's transaction with the SagaPay API. Check the webhook signature first (see below); this network call is an extra check on top of it. The API credentials are sent in the request body for this endpoint, not in headers.
 
 ```go
 verification, err := client.VerifyIPN(ctx, sagapay.VerifyIPNParams{
@@ -145,84 +150,73 @@ if verification.Verified {
 
 ## Handling Webhooks (IPN)
 
-SagaPay sends webhook notifications to your specified `ipnUrl` when a transaction completes. Delivery is at-least-once, so the same notification may arrive more than once - make your handling idempotent.
+SagaPay sends webhook notifications to your specified `ipnUrl` when a transaction completes. Each one carries a signature over the exact raw request body:
 
-Use the `WebhookHandler` to parse notifications and `client.VerifyIPN` to confirm them:
+```
+X-Sagapay-Merchant-Signature: sha256=<hex HMAC-SHA256 of the raw body>
+```
+
+It is keyed with your **signing secret**. Copy it from the dashboard: **Webhooks → Signing secret**. It is not your API secret, and nobody else's secret can produce a valid signature for your notifications. `WebhookHandler` checks the signature on every notification, and a handler created with an empty secret rejects them all.
 
 ```go
 package main
 
 import (
-    "context"
-    "errors"
     "log"
     "net/http"
-    "time"
+    "os"
 
     "github.com/rootdigit/sagapay-go-sdk"
 )
 
 func main() {
-    client, err := sagapay.NewClient(sagapay.Config{
-        APIKey:    "your-api-key",
-        APISecret: "your-api-secret",
-    })
-    if err != nil {
-        log.Fatalf("Failed to create client: %v", err)
-    }
+    // Webhooks → Signing secret. Optional: also refuse notifications older than a day.
+    webhookHandler := sagapay.NewWebhookHandler(os.Getenv("SAGAPAY_SIGNING_SECRET")).
+        WithMaxAge(sagapay.DefaultMaxAge)
 
-    // Create a webhook handler with your platform-issued IPN secret (an
-    // optional feature) - this is NOT your API secret. Pass "" if you have
-    // not been issued one; signature verification is then skipped and the
-    // VerifyIPN call below is the primary check.
-    webhookHandler := sagapay.NewWebhookHandler("")
-
-    // Set up a handler for webhook notifications
     http.HandleFunc("/webhook", func(w http.ResponseWriter, r *http.Request) {
-        // Parse the webhook (the signature is verified if an IPN secret is set)
+        // Verifies X-Sagapay-Merchant-Signature over the raw body, then parses it.
         payload, err := webhookHandler.HandleRequest(r)
         if err != nil {
-            log.Printf("Error processing webhook: %v", err)
-            sagapay.SendErrorResponse(w, err)
+            http.Error(w, "Invalid webhook", http.StatusUnauthorized)
             return
         }
 
-        // Confirm the notification with SagaPay - the primary check
-        ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
-        defer cancel()
-        verification, err := client.VerifyIPN(ctx, sagapay.VerifyIPNParams{
-            TxnHash: payload.TxHash,
-            Type:    payload.Type,
-            Amount:  payload.Amount,
-            Address: payload.Address,
-        })
-        if err != nil {
-            log.Printf("Error verifying IPN: %v", err)
-            sagapay.SendErrorResponse(w, err)
-            return
-        }
-        if !verification.Verified {
-            sagapay.SendErrorResponse(w, errors.New("IPN not verified"))
+        // Process each ID once. Delivery is at-least-once, and a replayed
+        // request carries a valid signature too.
+        if !markProcessed(payload.ID) { // e.g. INSERT ... ON CONFLICT DO NOTHING
+            sagapay.SendSuccessResponse(w)
             return
         }
 
-        // Handle the notification by type (status is currently always COMPLETED)
         switch payload.Type {
         case sagapay.IPNTypeDeposit:
-            // Payment successful, update your database
-            log.Printf("Deposit %s completed", payload.ID)
+            // Check what arrived before you credit it.
+            creditOrder(payload.UDF, payload.Asset, payload.ContractAddress, payload.Amount)
         case sagapay.IPNTypeWithdrawal:
-            log.Printf("Withdrawal %s completed", payload.ID)
+            markPayoutSent(payload.UDF, payload.TxHash)
         }
 
-        // Send a success response
+        // Answer 2xx within 20 seconds. If your own processing fails, answer
+        // 5xx instead so SagaPay retries.
         sagapay.SendSuccessResponse(w)
     })
 
-    // Start the server
     log.Fatal(http.ListenAndServe(":8080", nil))
 }
 ```
+
+If you read the body yourself, pass it with the header value to `webhookHandler.ProcessWebhook(body, r.Header.Get(sagapay.SignatureHeader))`.
+
+The old `X-Sagapay-Signature` header was keyed with a secret shared by every merchant. It is retired: SagaPay no longer sends it, and this SDK no longer reads it.
+
+### Replay protection
+
+A captured webhook still has a valid signature, so the signature alone does not stop someone resending it. Protect against that:
+
+- **Process each `id` once.** Record the IDs you have handled (a unique column works) and answer duplicates with a 200 without acting on them again. This is the main defence and also covers normal retries.
+- **Optionally check the age** with `WithMaxAge`, or `sagapay.IsFresh(payload, maxAge, time.Now())`. Keep the limit above the retry schedule (about 7.5 hours): retries reuse the original `timestamp`. A notification you resend from the dashboard also keeps it, so a resend older than your limit will be refused.
+- **Check what you are crediting.** Match `Asset`, `ContractAddress`, `Amount` and `Address` against the order before you fulfil it.
 
 ## Webhook Payload Format
 
@@ -235,6 +229,8 @@ When SagaPay sends a webhook to your endpoint, it will include the following pay
   "status": "COMPLETED",
   "address": "0x123abc...",
   "networkType": "ERC20|BEP20|TRC20|POLYGON|SOLANA",
+  "asset": "USDT",
+  "contractAddress": "0x55d398326f99059fF775485246999027B3197955",
   "amount": "10.5",
   "udf": "your-optional-user-defined-field",
   "txHash": "0xabc123...",
@@ -246,18 +242,10 @@ Notes:
 
 - `type` is uppercase (`DEPOSIT` or `WITHDRAWAL`), unlike the lowercase values used in API query parameters.
 - `status` is currently always `COMPLETED` - IPNs are only sent for completed transactions.
+- `asset` and `contractAddress` say what was received; `contractAddress` is `null` for the chain's native coin. `networkType` alone does not tell 100 TRX from 100 USDT.
 - `udf` and `txHash` may be `null`.
-- Delivery is at-least-once: process notifications idempotently.
-
-### Signature Header
-
-If you have been issued a platform IPN secret (an optional feature), each webhook request is signed with the header:
-
-```
-X-Sagapay-Signature: sha256=<hex HMAC-SHA256 of the exact raw request body>
-```
-
-The HMAC is keyed with the platform-issued IPN secret, NOT your API secret. `WebhookHandler` verifies this header automatically when constructed with the secret. Whether or not a signature is present, `client.VerifyIPN` is the primary way to confirm a notification is genuine.
+- `timestamp` is set when the transaction completes and does not change on retries.
+- SagaPay makes up to 6 delivery attempts, retrying after 1 min, 5 min, 15 min, 1 h and 6 h.
 
 ## Error Handling
 

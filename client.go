@@ -50,7 +50,9 @@ type Config struct {
 	// Timeout is the timeout for API requests
 	Timeout time.Duration
 
-	// HTTPClient is the HTTP client to use for API requests
+	// HTTPClient is the HTTP client to use for API requests. Set its
+	// CheckRedirect to return http.ErrUseLastResponse: net/http resends the
+	// x-api-key and x-api-secret headers when it follows a redirect.
 	HTTPClient *http.Client
 }
 
@@ -82,6 +84,11 @@ func NewClient(config Config) (*Client, error) {
 		}
 		httpClient = &http.Client{
 			Timeout: timeout,
+			// The API never redirects. net/http would resend the x-api-key
+			// and x-api-secret headers to the new location.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 		}
 	}
 
@@ -120,8 +127,13 @@ func (c *Client) CreateWithdrawal(ctx context.Context, params CreateWithdrawalPa
 		return nil, err
 	}
 
+	var headers http.Header
+	if params.IdempotencyKey != "" {
+		headers = http.Header{"Idempotency-Key": {params.IdempotencyKey}}
+	}
+
 	var response WithdrawalResponse
-	err := c.sendRequest(ctx, http.MethodPost, endpoint, params, &response)
+	err := c.doRequest(ctx, http.MethodPost, endpoint, nil, params, &response, true, headers)
 	if err != nil {
 		return nil, err
 	}
@@ -216,7 +228,7 @@ func (c *Client) VerifyIPN(ctx context.Context, params VerifyIPNParams) (*Verify
 	}
 
 	var response VerifyIPNResponse
-	err := c.doRequest(ctx, http.MethodPost, endpoint, nil, body, &response, false)
+	err := c.doRequest(ctx, http.MethodPost, endpoint, nil, body, &response, false, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -231,13 +243,14 @@ func (c *Client) sendRequest(ctx context.Context, method, path string, body inte
 
 // sendRequestWithQuery sends an authenticated API request with query parameters and parses the response
 func (c *Client) sendRequestWithQuery(ctx context.Context, method, path string, query url.Values, body interface{}, v interface{}) error {
-	return c.doRequest(ctx, method, path, query, body, v, true)
+	return c.doRequest(ctx, method, path, query, body, v, true, nil)
 }
 
 // doRequest sends an API request and parses the response. When withAuth is
 // false, the x-api-key/x-api-secret headers are omitted (used by endpoints
-// such as verify-ipn that take the credentials in the request body).
-func (c *Client) doRequest(ctx context.Context, method, path string, query url.Values, body interface{}, v interface{}, withAuth bool) error {
+// such as verify-ipn that take the credentials in the request body). headers
+// are added to the request.
+func (c *Client) doRequest(ctx context.Context, method, path string, query url.Values, body interface{}, v interface{}, withAuth bool, headers http.Header) error {
 	// Create the request URL
 	u, err := url.Parse(path)
 	if err != nil {
@@ -267,6 +280,11 @@ func (c *Client) doRequest(ctx context.Context, method, path string, query url.V
 	}
 
 	// Set headers
+	for name, values := range headers {
+		for _, value := range values {
+			req.Header.Add(name, value)
+		}
+	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 	if withAuth {
@@ -282,6 +300,9 @@ func (c *Client) doRequest(ctx context.Context, method, path string, query url.V
 	defer resp.Body.Close()
 
 	// Parse the response
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		return &APIError{ErrMessage: "unexpected redirect from the API", Code: resp.StatusCode}
+	}
 	if resp.StatusCode >= 400 {
 		var apiErr APIError
 		if err := json.NewDecoder(resp.Body).Decode(&apiErr); err != nil {

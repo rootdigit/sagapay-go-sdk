@@ -94,6 +94,12 @@ type CreateWithdrawalParams struct {
 	Amount          string      `json:"amount"`
 	IPNUrl          string      `json:"ipnUrl"`
 	UDF             string      `json:"udf,omitempty"`
+
+	// IdempotencyKey is sent as the Idempotency-Key header: 1-128 letters,
+	// digits, '-' or '_'. Retrying with the same key within 24 hours returns
+	// the first request's withdrawal instead of creating a second one. Use
+	// one key per payout. Optional, recommended.
+	IdempotencyKey string `json:"-"`
 }
 
 // Validate validates the create withdrawal parameters
@@ -190,10 +196,15 @@ type WebhookPayload struct {
 	Status      TransactionStatus `json:"status"` // Currently always COMPLETED
 	Address     string            `json:"address"`
 	NetworkType NetworkType       `json:"networkType"`
-	Amount      string            `json:"amount"`
-	UDF         string            `json:"udf,omitempty"`
-	TxHash      string            `json:"txHash,omitempty"`
-	Timestamp   time.Time         `json:"timestamp"`
+	// Asset and ContractAddress say what was received: the token symbol and
+	// its contract / mint (empty for the chain's native coin). NetworkType
+	// alone does not tell 100 TRX from 100 USDT, so check them before crediting.
+	Asset           string    `json:"asset,omitempty"`
+	ContractAddress string    `json:"contractAddress,omitempty"`
+	Amount          string    `json:"amount"`
+	UDF             string    `json:"udf,omitempty"`
+	TxHash          string    `json:"txHash,omitempty"`
+	Timestamp       time.Time `json:"timestamp"` // Set at completion; unchanged on retries
 }
 
 // VerifyIPNParams represents the parameters for verifying an IPN notification

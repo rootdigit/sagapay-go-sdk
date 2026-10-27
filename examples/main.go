@@ -56,6 +56,7 @@ func main() {
 		Amount:          "10.5",
 		IPNUrl:          "https://yourwebsite.com/webhook",
 		UDF:             "withdrawal-456",
+		IdempotencyKey:  "payout-456", // a retry with the same key cannot send the money twice
 	})
 	if err != nil {
 		log.Fatalf("Failed to create withdrawal: %v", err)

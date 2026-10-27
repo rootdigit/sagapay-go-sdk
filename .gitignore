@@ -29,3 +29,12 @@ go.work.sum
 # OS files
 .DS_Store
 Thumbs.db
+
+# Secrets and data dumps: never commit these.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.dump
+backups/
